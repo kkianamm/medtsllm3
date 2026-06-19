@@ -23,7 +23,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 class MedTsLLM(nn.Module):
 
-    supported_tasks = ["forecasting", "reconstruction", "anomaly_detection", "semantic_segmentation", "segmentation", "pretraining"]
+    supported_tasks = ["forecasting", "reconstruction", "anomaly_detection", "semantic_segmentation", "segmentation", "classification", "pretraining"]
     supported_modes = ["univariate", "multivariate"]
 
     def __init__(self, config, dataset):
@@ -57,6 +57,20 @@ class MedTsLLM(nn.Module):
 
         self.n_classes = dataset.n_classes if self.task in ["classification", "semantic_segmentation"] else 0
 
+        # --- BiomedCoOp-style class-description prompting (optional) ---
+        self.class_descriptions = None
+        _pcfg = self.model_config.get("prompting")
+        if _pcfg is not None and _pcfg.get("class_prompts", False) and self.task == "classification":
+            from .biomedcoop_ts import load_class_prompts
+            _name_map = {"NORM": "Normal ECG", "MI": "Myocardial Infarction",
+                         "STTC": "ST/T Change", "CD": "Conduction Disturbance",
+                         "HYP": "Hypertrophy"}
+            self.class_codes = _pcfg.get("class_codes", list(_name_map.keys()))
+            self.class_names = _pcfg.get("class_names", None) or [_name_map.get(c, c) for c in self.class_codes]
+            self.class_descriptions = load_class_prompts(_pcfg.class_prompts_path, self.class_codes)
+            self.class_prompts_k = _pcfg.get("class_prompts_per_class", 3)
+            self.class_prompts_sample = _pcfg.get("class_prompts_sample", True)
+
         if self.task in ["forecasting", "reconstruction", "anomaly_detection", "pretraining"]:
             self.n_outputs_per_step = self.n_features
         elif self.task == "semantic_segmentation":
@@ -64,9 +78,17 @@ class MedTsLLM(nn.Module):
         elif self.task == "segmentation":
             self.n_outputs_per_step = 1
             assert self.config.tasks.segmentation.mode in ["boundary-prediction", "steps-to-boundary"]
+        elif self.task == "classification":
+            # Sequence-level: a single label per window over K classes.
+            self.n_outputs_per_step = self.n_classes if self.n_classes > 2 else 1
         else:
             raise ValueError(f"Task {self.task} is not supported.")
-        self.n_outputs = self.n_outputs_per_step * self.pred_len
+
+        if self.task == "classification":
+            # Classification yields one sequence-level prediction (not per time step).
+            self.n_outputs = self.n_outputs_per_step
+        else:
+            self.n_outputs = self.n_outputs_per_step * self.pred_len
 
         match self.covariate_mode:
             case "univariate":
@@ -254,6 +276,11 @@ class MedTsLLM(nn.Module):
                     pred = F.softmax(pred, dim=-1)
                 else:
                     pred = F.sigmoid(pred)
+            elif self.task == "classification":
+                if self.n_classes > 2:
+                    pred = F.softmax(pred, dim=-1)
+                else:
+                    pred = F.sigmoid(pred)
             elif self.task == "segmentation":
                 if self.config.tasks.segmentation.mode == "boundary-prediction":
                     pred = F.sigmoid(pred)
@@ -364,7 +391,21 @@ class MedTsLLM(nn.Module):
 
         # dec_out = dec_out[:, -self.n_patches:, :self.d_ff]
         dec_out = dec_out.permute(0, 2, 1).contiguous() # [bs, d_ff, n_patches]
-        dec_out = self.output_projection(dec_out)       # [bs, pred_len * n_features]
+        dec_out = self.output_projection(dec_out)       # [bs, n_outputs] (= [bs, pred_len*n_features] for non-classification)
+
+        if self.task == "classification":
+            # dec_out is [bs, n_outputs_per_step], or [bs*n_features, n_outputs_per_step]
+            # for the "independent"/"merge-end" covariate strategies. Collapse to [bs, K].
+            if self.covariate_mode == "independent":
+                dec_out = dec_out.view(bs, self.n_features, self.n_outputs_per_step).mean(dim=1)
+            elif self.covariate_mode == "merge-end":
+                dec_out = dec_out.view(bs, self.n_features * self.n_outputs_per_step)
+                dec_out = self.feature_weighting(dec_out)
+            else:
+                dec_out = dec_out.view(bs, self.n_outputs_per_step)
+            if self.n_outputs_per_step == 1:
+                dec_out = dec_out.squeeze(-1)
+            return dec_out
 
         if self.covariate_mode == "independent":
             dec_out = dec_out.view(bs, self.n_features, self.pred_len, self.n_outputs_per_step)
@@ -382,6 +423,19 @@ class MedTsLLM(nn.Module):
             dec_out = dec_out.squeeze(-1)
 
         return dec_out
+
+    def build_class_prompt(self):
+        import random
+        parts = []
+        for i, (name, descs) in enumerate(zip(self.class_names, self.class_descriptions)):
+            k = min(self.class_prompts_k, len(descs))
+            if self.class_prompts_sample and self.training:
+                chosen = random.sample(descs, k)
+            else:
+                chosen = descs[:k]
+            feats = " ".join(d.strip().rstrip(".") + "." for d in chosen)
+            parts.append(f"({i+1}) {name}: {feats}")
+        return "Diagnostic categories and their characteristic ECG features: " + " ".join(parts)
 
     def build_prompt(self, inputs):
         bs = inputs["x_enc"].size(0)
@@ -419,6 +473,11 @@ class MedTsLLM(nn.Module):
         else:
             task_prompt = ""
 
+        if cfg.get("class_prompts", False) and self.class_descriptions is not None:
+            class_prompt = self.build_class_prompt()
+        else:
+            class_prompt = ""
+
         bos = self.tokenizer.bos_token if self.tokenizer.bos_token is not None else ""
 
         prompts = []
@@ -426,6 +485,7 @@ class MedTsLLM(nn.Module):
             parts = [
                 bos,
                 dataset_prompt,
+                class_prompt,
                 *example_prompts[b],
                 clip_prompts[b],
                 input_stats_prompts[b],
@@ -507,6 +567,8 @@ class MedTsLLM(nn.Module):
             self.task_description = f"Classify the past {self.seq_len} steps of data as accurately as possible using the following information."
         elif self.task == "segmentation":
             self.task_description = f"Identify the change points in the past {self.seq_len} steps of data to segment the sequence."
+        elif self.task == "classification":
+            self.task_description = f"Classify the entire {self.seq_len}-step sequence into one of {dataset.n_classes} diagnostic categories."
         else:
             raise ValueError(f"Task {self.task} is not supported.")
 
