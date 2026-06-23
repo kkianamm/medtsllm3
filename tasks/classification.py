@@ -2,9 +2,15 @@
 Sequence-level classification task for MedTsLLM-family models.
 
 Cross-entropy training with accuracy / F1 / precision / recall (macro) scoring.
-If the model exposes an `aux_loss` attribute (e.g. BiomedCoOpTS, which returns
-SCCM + KDSP regularizers), it is added to the cross-entropy loss during training.
-This is backward compatible: models without `aux_loss` contribute nothing.
+Records per-epoch TRAIN and TEST (and VAL) metrics into `self.history`, which
+train.py writes to a JSON file at the end of the run.
+
+Train metrics are computed from the logits already produced during the training
+loop (running predictions), so they add no extra forward pass over the train set.
+
+If the model exposes an `aux_loss` attribute (e.g. BiomedCoOpTS), it is added to
+the cross-entropy loss during training. Backward compatible: models without
+`aux_loss` contribute nothing.
 """
 
 import torch
@@ -21,11 +27,23 @@ class ClassificationTask(BaseTask):
     def __init__(self, run_id, config, newrun=True):
         self.task = "classification"
         super(ClassificationTask, self).__init__(run_id, config, newrun)
+        self.history = []   # per-epoch train/val/test metrics
+
+    def _metrics(self, pred_int, target_int, prefix):
+        avg = "binary" if self.train_dataset.n_classes == 2 else "macro"
+        return {
+            f"{prefix}/accuracy": accuracy_score(target_int, pred_int),
+            f"{prefix}/f1": f1_score(target_int, pred_int, average=avg, zero_division=0),
+            f"{prefix}/precision": precision_score(target_int, pred_int, average=avg, zero_division=0),
+            f"{prefix}/recall": recall_score(target_int, pred_int, average=avg, zero_division=0),
+        }
 
     def train(self):
         for epoch in range(self.config.training.epochs):
             print(f"Epoch {epoch + 1}/{self.config.training.epochs}")
             self.model.train()
+
+            train_preds, train_targets = [], []
             for inputs in tqdm(self.train_dataloader):
                 inputs = self.prepare_batch(inputs)
 
@@ -37,7 +55,6 @@ class ClassificationTask(BaseTask):
                     else:
                         loss = self.loss_fn(logits, labels)
 
-                    # add SCCM + KDSP (or any auxiliary regularizer) if the model exposes it
                     aux = getattr(self.model, "aux_loss", None)
                     if aux is not None:
                         loss = loss + aux
@@ -47,8 +64,29 @@ class ClassificationTask(BaseTask):
                 self.optimizer.zero_grad()
                 self.log_step(loss.item())
 
+                # collect running train predictions (free: logits already computed)
+                with torch.no_grad():
+                    if logits.ndim == 1:
+                        preds = (logits > 0).long()
+                    else:
+                        preds = logits.argmax(dim=-1)
+                train_preds.append(preds.detach().cpu())
+                train_targets.append(labels.detach().cpu())
+
+            # ----- per-epoch metrics -----
+            tp = torch.cat(train_preds).int().numpy()
+            tt = torch.cat(train_targets).int().numpy()
+            train_scores = self._metrics(tp, tt, "train")
+
             val_scores = self.val()
-            self.log_epoch(val_scores)
+            test_scores = self.test()
+
+            epoch_record = {"epoch": epoch + 1,
+                            **train_scores, **val_scores, **test_scores}
+            self.history.append(epoch_record)
+
+            # log_epoch needs val/<eval_metric> present for best-model tracking
+            self.log_epoch({**train_scores, **val_scores, **test_scores})
             self.scheduler.step()
 
         self.model.eval()
@@ -79,15 +117,11 @@ class ClassificationTask(BaseTask):
         return torch.cat(all_probs, 0), torch.cat(all_targets, 0)
 
     def score(self, pred_scores, target):
-        avg = "binary" if pred_scores.size(1) == 2 else "macro"
         pred = pred_scores.argmax(dim=1).int().numpy()
         target = target.int().numpy()
-        return {
-            "accuracy": accuracy_score(target, pred),
-            "f1": f1_score(target, pred, average=avg, zero_division=0),
-            "precision": precision_score(target, pred, average=avg, zero_division=0),
-            "recall": recall_score(target, pred, average=avg, zero_division=0),
-        }
+        # reuse _metrics but strip the prefix (val()/test() add their own)
+        m = self._metrics(pred, target, "x")
+        return {k.split("/", 1)[1]: v for k, v in m.items()}
 
     def build_loss(self):
         is_binary = (self.train_dataset.n_classes == 2)
